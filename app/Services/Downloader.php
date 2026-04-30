@@ -55,6 +55,78 @@ class Downloader
         return ['filename' => $filename, 'size' => $size];
     }
 
+    /**
+     * Stream-download a URL while the caller decides where to write — used for the
+     * local-storage flow where we want to commit to a final path (and a public URL)
+     * before any bytes hit disk.
+     *
+     * The destination factory receives the resolved filename and Content-Length
+     * (0 if unknown) and must return an open writable stream resource. The download
+     * body is piped into that stream and flushed after every chunk so HTTP clients
+     * reading the path can see partial bytes as they arrive.
+     *
+     * @param  callable(string, int): resource  $destinationFactory
+     * @return array{filename: string, size: int}
+     */
+    public function streamingDownload(
+        string $url,
+        callable $destinationFactory,
+        callable $onProgress,
+        int $maxBytes,
+    ): array {
+        $response = $this->client->request('GET', $url, [
+            'stream' => true,
+            'http_errors' => true,
+            'connect_timeout' => 30,
+            'timeout' => 0,
+            'allow_redirects' => true,
+            'headers' => [
+                'User-Agent' => 'amirworker_bot/1.0',
+            ],
+        ]);
+
+        $filename = $this->guessFilename($url, $response->getHeaderLine('Content-Disposition'));
+        $contentLength = (int) ($response->getHeaderLine('Content-Length') ?: 0);
+
+        if ($maxBytes > 0 && $contentLength > $maxBytes) {
+            throw new RuntimeException('File exceeds size cap of '.$this->formatBytes($maxBytes));
+        }
+
+        $sink = $destinationFactory($filename, $contentLength);
+
+        if (! is_resource($sink)) {
+            throw new RuntimeException('destinationFactory must return an open resource');
+        }
+
+        $body = $response->getBody();
+        $size = 0;
+
+        try {
+            while (! $body->eof()) {
+                $chunk = $body->read(64 * 1024);
+                if ($chunk === '') {
+                    continue;
+                }
+                $written = fwrite($sink, $chunk);
+                if ($written === false) {
+                    throw new RuntimeException('Write failed');
+                }
+                $size += $written;
+                if ($maxBytes > 0 && $size > $maxBytes) {
+                    throw new RuntimeException('File exceeds size cap of '.$this->formatBytes($maxBytes));
+                }
+                fflush($sink);
+                $onProgress($contentLength, $size);
+            }
+        } finally {
+            if (is_resource($sink)) {
+                fclose($sink);
+            }
+        }
+
+        return ['filename' => $filename, 'size' => $size];
+    }
+
     private function guessFilename(string $url, string $contentDisposition): string
     {
         if ($contentDisposition !== '') {
