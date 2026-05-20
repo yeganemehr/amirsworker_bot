@@ -16,8 +16,13 @@ class Downloader
      *
      * @return array{filename: string, size: int}
      */
-    public function download(string $url, string $sinkPath, callable $onProgress, int $maxBytes): array
-    {
+    public function download(
+        string $url,
+        string $sinkPath,
+        callable $onProgress,
+        int $maxBytes,
+        ?string $preferredFilename = null,
+    ): array {
         $sink = fopen($sinkPath, 'w');
 
         if ($sink === false) {
@@ -32,7 +37,7 @@ class Downloader
                 'timeout' => 0,
                 'allow_redirects' => true,
                 'headers' => [
-                    'User-Agent' => 'amirworker_bot/1.0',
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
                 ],
                 'progress' => function ($total, $downloaded) use ($onProgress, $maxBytes) {
                     if ($maxBytes > 0 && ($total > $maxBytes || $downloaded > $maxBytes)) {
@@ -50,7 +55,9 @@ class Downloader
         }
 
         $size = (int) (filesize($sinkPath) ?: 0);
-        $filename = $this->guessFilename($url, $response->getHeaderLine('Content-Disposition'));
+        $filename = $preferredFilename !== null
+            ? $this->sanitize($preferredFilename)
+            : $this->guessFilename($url, $response->getHeaderLine('Content-Disposition'));
 
         return ['filename' => $filename, 'size' => $size];
     }
@@ -73,6 +80,7 @@ class Downloader
         callable $destinationFactory,
         callable $onProgress,
         int $maxBytes,
+        ?string $preferredFilename = null,
     ): array {
         $response = $this->client->request('GET', $url, [
             'stream' => true,
@@ -81,11 +89,13 @@ class Downloader
             'timeout' => 0,
             'allow_redirects' => true,
             'headers' => [
-                'User-Agent' => 'amirworker_bot/1.0',
+                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
             ],
         ]);
 
-        $filename = $this->guessFilename($url, $response->getHeaderLine('Content-Disposition'));
+        $filename = $preferredFilename !== null
+            ? $this->sanitize($preferredFilename)
+            : $this->guessFilename($url, $response->getHeaderLine('Content-Disposition'));
         $contentLength = (int) ($response->getHeaderLine('Content-Length') ?: 0);
 
         if ($maxBytes > 0 && $contentLength > $maxBytes) {

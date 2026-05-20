@@ -16,10 +16,11 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use RuntimeException;
 use SergiX44\Nutgram\Nutgram;
 use Throwable;
 
-class ProcessUrlsJob implements ShouldQueue
+class ProcessUrlJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -27,14 +28,13 @@ class ProcessUrlsJob implements ShouldQueue
 
     public int $tries = 1;
 
-    /**
-     * @param  array<int, string>  $urls
-     */
     public function __construct(
         public readonly int $chatId,
         public readonly int $statusMessageId,
         public readonly int $userId,
-        public readonly array $urls,
+        public readonly ?string $url = null,
+        public readonly ?string $telegramFileId = null,
+        public readonly ?string $preferredFilename = null,
     ) {}
 
     /**
@@ -58,43 +58,69 @@ class ProcessUrlsJob implements ShouldQueue
             (int) config('app.progress_edit_interval_ms'),
         );
 
-        $total = count($this->urls);
-        $summary = [];
+        $sourceLabel = $this->preferredFilename ?? $this->url ?? 'file';
 
-        foreach ($this->urls as $i => $url) {
-            $idx = $i + 1;
+        try {
+            [$downloadUrl, $sourceLabel, $sourceUrl] = $this->resolveSource($bot, $reporter);
 
-            try {
-                $reporter->report("⏳ [{$idx}/{$total}] Starting…\n{$url}", force: true);
+            $reporter->report("⏳ Starting…\n{$sourceLabel}", force: true);
 
-                if ($this->isLocalDriver(config('app.disk'))) {
-                    $entry = $this->processLocal($downloader, $reporter, $idx, $total, $url);
-                } else {
-                    $entry = $this->processRemote($downloader, $uploader, $reporter, $idx, $total, $url);
-                }
+            $result = $this->isLocalDriver(config('app.disk'))
+                ? $this->processLocal($downloader, $reporter, $downloadUrl, $sourceLabel, $sourceUrl)
+                : $this->processRemote($downloader, $uploader, $reporter, $downloadUrl, $sourceLabel, $sourceUrl);
 
-                $summary[] = $entry;
-            } catch (Throwable $e) {
-                Log::error('amirworker: url processing failed', [
-                    'url' => $url,
-                    'user_id' => $this->userId,
-                    'error' => $e->getMessage(),
-                ]);
-                $summary[] = sprintf("❌ [%d/%d] %s\n%s", $idx, $total, $url, $e->getMessage());
+            $reporter->report($result, force: true);
+        } catch (Throwable $e) {
+            Log::error('processing failed', [
+                'url' => $this->url,
+                'telegram_file_id' => $this->telegramFileId,
+                'user_id' => $this->userId,
+                'error' => $e->getMessage(),
+            ]);
+            $reporter->report(sprintf("❌ %s\n%s", $sourceLabel, $e->getMessage()), force: true);
+        }
+    }
+
+    /**
+     * Resolve the job's source into a concrete [downloadUrl, displayLabel, sourceUrlForUploadRow].
+     *
+     * @return array{0: string, 1: string, 2: string}
+     */
+    private function resolveSource(Nutgram $bot, ProgressReporter $reporter): array
+    {
+        if ($this->telegramFileId !== null) {
+            $reporter->report('⏳ Fetching file info from Telegram…', force: true);
+
+            $file = $bot->getFile($this->telegramFileId);
+            if ($file === null || empty($file->file_path)) {
+                throw new RuntimeException('Could not resolve Telegram file (it may exceed 20 MB).');
             }
 
-            $reporter->report(implode("\n\n", $summary), force: true);
+            $token = (string) config('nutgram.token');
+            if ($token === '') {
+                throw new RuntimeException('TELEGRAM_TOKEN is not configured.');
+            }
+
+            $downloadUrl = "https://api.telegram.org/file/bot{$token}/{$file->file_path}";
+            $label = $this->preferredFilename ?? basename($file->file_path);
+            $sourceUrl = 'telegram-file:'.$this->telegramFileId;
+
+            return [$downloadUrl, $label, $sourceUrl];
         }
 
-        $reporter->report(implode("\n\n", $summary)."\n\nDone.", force: true);
+        if ($this->url !== null) {
+            return [$this->url, $this->url, $this->url];
+        }
+
+        throw new RuntimeException('ProcessUrlJob requires either a url or a telegramFileId.');
     }
 
     private function processLocal(
         Downloader $downloader,
         ProgressReporter $reporter,
-        int $idx,
-        int $total,
-        string $url,
+        string $downloadUrl,
+        string $sourceLabel,
+        string $sourceUrl,
     ): string {
         $disk = config('app.disk');
         $expiresAt = now()->addHours((int) config('app.retention_hours'));
@@ -102,9 +128,9 @@ class ProcessUrlsJob implements ShouldQueue
         $key = null;
         $publicUrl = null;
         $info = $downloader->streamingDownload(
-            url: $url,
+            url: $downloadUrl,
             destinationFactory: function (string $filename, int $contentLength) use (
-                &$key, &$publicUrl, $disk, $expiresAt, $reporter, $idx, $total, $url,
+                &$key, &$publicUrl, $disk, $expiresAt, $reporter, $sourceLabel,
             ) {
                 $key = $this->buildStorageKey($filename);
                 $publicUrl = $this->buildPublicUrl($disk, $key, $expiresAt);
@@ -112,40 +138,37 @@ class ProcessUrlsJob implements ShouldQueue
                 $absPath = Storage::disk($disk)->path($key);
                 $dir = dirname($absPath);
                 if (! is_dir($dir) && ! mkdir($dir, 0755, true) && ! is_dir($dir)) {
-                    throw new \RuntimeException("Could not create directory: {$dir}");
+                    throw new RuntimeException("Could not create directory: {$dir}");
                 }
 
                 $reporter->report(sprintf(
-                    "⬇️ [%d/%d] Streaming %s\nSource: %s\nLink (live): %s",
-                    $idx,
-                    $total,
+                    "⬇️ Streaming %s\nSource: %s\nLink (live): %s",
                     $filename,
-                    $url,
+                    $sourceLabel,
                     $publicUrl,
                 ), force: true);
 
                 $sink = fopen($absPath, 'w');
                 if ($sink === false) {
-                    throw new \RuntimeException("Could not open destination: {$absPath}");
+                    throw new RuntimeException("Could not open destination: {$absPath}");
                 }
 
                 return $sink;
             },
-            onProgress: function (int $tot, int $dl) use ($reporter, $idx, $total, &$publicUrl) {
+            onProgress: function (int $tot, int $dl) use ($reporter, &$publicUrl) {
                 $reporter->report(sprintf(
-                    "⬇️ [%d/%d] Streaming\n%s\nLink (live): %s",
-                    $idx,
-                    $total,
+                    "⬇️ Streaming\n%s\nLink (live): %s",
                     ProgressReporter::renderBar($tot, $dl),
                     $publicUrl,
                 ));
             },
             maxBytes: (int) config('app.max_download_bytes'),
+            preferredFilename: $this->preferredFilename,
         );
 
         Upload::create([
             'telegram_user_id' => $this->userId,
-            'source_url' => $url,
+            'source_url' => $sourceUrl,
             'disk' => $disk,
             'path' => $key,
             'public_url' => $publicUrl,
@@ -153,33 +176,32 @@ class ProcessUrlsJob implements ShouldQueue
             'expires_at' => $expiresAt,
         ]);
 
-        return sprintf("✅ [%d/%d] %s\n%s", $idx, $total, $info['filename'], $publicUrl);
+        return sprintf("✅ %s\n%s", $info['filename'], $publicUrl);
     }
 
     private function processRemote(
         Downloader $downloader,
         Uploader $uploader,
         ProgressReporter $reporter,
-        int $idx,
-        int $total,
-        string $url,
+        string $downloadUrl,
+        string $sourceLabel,
+        string $sourceUrl,
     ): string {
         $tmp = tempnam(sys_get_temp_dir(), 'amrj_');
 
         try {
             $info = $downloader->download(
-                $url,
+                $downloadUrl,
                 $tmp,
-                function (int $tot, int $dl) use ($reporter, $idx, $total, $url) {
+                function (int $tot, int $dl) use ($reporter, $sourceLabel) {
                     $reporter->report(sprintf(
-                        "⬇️ [%d/%d] Downloading\n%s\n%s",
-                        $idx,
-                        $total,
-                        $url,
+                        "⬇️ Downloading\n%s\n%s",
+                        $sourceLabel,
                         ProgressReporter::renderBar($tot, $dl),
                     ));
                 },
                 (int) config('app.max_download_bytes'),
+                $this->preferredFilename,
             );
 
             $key = $this->buildStorageKey($info['filename']);
@@ -187,11 +209,9 @@ class ProcessUrlsJob implements ShouldQueue
             $uploader->upload(
                 $tmp,
                 $key,
-                function (int $tot, int $up) use ($reporter, $idx, $total, $info) {
+                function (int $tot, int $up) use ($reporter, $info) {
                     $reporter->report(sprintf(
-                        "⬆️ [%d/%d] Uploading\n%s\n%s",
-                        $idx,
-                        $total,
+                        "⬆️ Uploading\n%s\n%s",
                         $info['filename'],
                         ProgressReporter::renderBar($tot, $up),
                     ));
@@ -204,7 +224,7 @@ class ProcessUrlsJob implements ShouldQueue
 
             Upload::create([
                 'telegram_user_id' => $this->userId,
-                'source_url' => $url,
+                'source_url' => $sourceUrl,
                 'disk' => $disk,
                 'path' => $key,
                 'public_url' => $publicUrl,
@@ -212,7 +232,7 @@ class ProcessUrlsJob implements ShouldQueue
                 'expires_at' => $expiresAt,
             ]);
 
-            return sprintf("✅ [%d/%d] %s\n%s", $idx, $total, $info['filename'], $publicUrl);
+            return sprintf("✅ %s\n%s", $info['filename'], $publicUrl);
         } finally {
             if (is_string($tmp) && is_file($tmp)) {
                 @unlink($tmp);
@@ -244,6 +264,11 @@ class ProcessUrlsJob implements ShouldQueue
             return $fs->temporaryUrl($key, $expiresAt);
         }
 
-        return $fs->url($key);
+        return $fs->url($this->encodePathSegments($key));
+    }
+
+    private function encodePathSegments(string $key): string
+    {
+        return implode('/', array_map('rawurlencode', explode('/', $key)));
     }
 }
