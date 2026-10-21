@@ -1,4 +1,4 @@
-FROM dunglas/frankenphp:1.12.2-php8.4-alpine
+FROM dunglas/frankenphp:1-php8.4-alpine
 
 RUN --mount=type=bind,source=.docker/fs,target=/mnt \
     apk add --no-cache supervisor && \
