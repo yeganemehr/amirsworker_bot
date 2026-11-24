@@ -124,7 +124,6 @@ class BotHelpers
     public static function rewriteUrl(string $url): string
     {
         $prefixRewrites = [
-            'https://cinema-tika.com/pages/dln/' => 'https://sv68.gcpgermany.com/dln/',
         ];
 
         foreach ($prefixRewrites as $from => $to) {
